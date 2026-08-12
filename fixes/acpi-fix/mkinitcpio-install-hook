@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# mkinitcpio install hook "acpi_override": embeds ACPI table overrides
+# (/etc/acpi-override/*.aml) into the uncompressed early cpio at
+# kernel/firmware/acpi/, where the kernel's ACPI table upgrade mechanism
+# (CONFIG_ACPI_TABLE_UPGRADE) applies them before ACPI initialization.
+# Works identically for plain initramfs images and UKIs — the early cpio
+# ends up inside the UKI's .initrd section, so no bootloader entry is
+# needed and kernel updates keep the override automatically.
+# Installed to /etc/initcpio/install/acpi_override by acpi-fix/3-install.sh.
+
+build() {
+    local f found=0
+    for f in /etc/acpi-override/*.aml; do
+        [[ -e "$f" ]] || continue
+        quiet "adding ACPI override table: '%s'" "$f"
+        add_file_early "$f" "/kernel/firmware/acpi/${f##*/}" 644
+        found=1
+    done
+    (( found )) || warning "acpi_override: no *.aml files in /etc/acpi-override/"
+}
+
+help() {
+    cat <<HELPEOF
+Embeds ACPI override tables from /etc/acpi-override/*.aml into the
+uncompressed early cpio (kernel/firmware/acpi/), where the kernel's ACPI
+table upgrade mechanism applies them at boot. See the kernel's
+Documentation/admin-guide/acpi/initrd_table_override.rst.
+HELPEOF
+}
+
+# vim: set ft=sh ts=4 sw=4 et:

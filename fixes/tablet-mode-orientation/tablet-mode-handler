@@ -1,0 +1,80 @@
+#!/bin/bash
+# Keep the display in landscape while in laptop mode on this convertible.
+#
+# mutter does not reliably bring the user session up in the right orientation on
+# this EDID-less DSI panel -- it can get stuck portrait (transform 1) in laptop
+# mode, and nothing self-corrects. In tablet mode mutter auto-rotates from the
+# accelerometer, which we want, so we only act in laptop mode.
+#
+# This watches the "Intel HID switches" SW_TABLET_MODE event and, per mode, calls
+# restore.py to:
+#   - laptop mode: enforce a FIXED known-good landscape (transform 0, scale 1.0)
+#                  and turn the on-screen keyboard OFF for user sessions;
+#   - tablet mode: turn the on-screen keyboard ON for user sessions, leaving
+#                  orientation to mutter's accelerometer auto-rotation.
+# It acts on every tablet<->laptop transition AND periodically (self-heals a
+# session that came up wrong, e.g. a freshly-logged-in user session). restore.py
+# is idempotent (it only touches mutter / dconf when the state differs), so the
+# periodic re-apply causes no flicker. Both the GDM greeter and the user session
+# are handled for orientation; the OSK is driven only for user sessions (the
+# greeter manages its own). We do NOT snapshot live state -- doing so was a
+# feedback trap that re-applied a wrong (portrait) orientation forever.
+
+set -u
+
+SWITCH_NAME="Intel HID switches"
+HELPER="/usr/local/lib/tablet-orientation/restore.py"
+ENFORCE_INTERVAL=5   # seconds; re-check laptop-mode orientation this often
+
+find_switch_device() {
+    local name_file
+    for name_file in /sys/class/input/event*/device/name; do
+        if [ "$(cat "$name_file" 2>/dev/null)" = "$SWITCH_NAME" ]; then
+            echo "/dev/input/$(basename "$(dirname "$(dirname "$name_file")")")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+apply_mode() {
+    # $1 = current mode (0 laptop / 1 tablet)
+    if [ "$1" = 1 ]; then python3 "$HELPER" tablet; else python3 "$HELPER" laptop; fi
+}
+
+DEV=$(find_switch_device) || { echo "Switch device '$SWITCH_NAME' not found"; exit 1; }
+echo "Monitoring $DEV ($SWITCH_NAME) for tablet-mode changes..."
+
+# Read the CURRENT switch state so a restart while folded into tablet mode is not
+# mistaken for laptop mode. `evtest --query` exits 10 when SW_TABLET_MODE is set.
+mode=0
+evtest --query "$DEV" EV_SW SW_TABLET_MODE >/dev/null 2>&1
+[ $? -eq 10 ] && mode=1   # exit 10 = switch active = tablet
+apply_mode "$mode"
+
+# stdbuf -oL keeps evtest's output line-buffered through the pipe so the read
+# loop reacts immediately. read -t lets us periodically re-apply (self-heal).
+stdbuf -oL evtest "$DEV" 2>/dev/null | while true; do
+    if IFS= read -r -t "$ENFORCE_INTERVAL" line; then
+        case "$line" in
+            *SW_TABLET_MODE*"value 1"*)
+                mode=1
+                apply_mode 1
+                ;;
+            *SW_TABLET_MODE*"value 0"*)
+                mode=0
+                sleep 0.3   # let mutter settle after the switch
+                apply_mode 0
+                ;;
+        esac
+    else
+        rc=$?
+        if [ "$rc" -le 128 ]; then
+            # EOF / read error -> evtest died; let systemd restart us.
+            echo "evtest stream ended (rc=$rc); exiting for restart"
+            exit 1
+        fi
+        # timeout: self-heal orientation + OSK state for the current mode
+        apply_mode "$mode"
+    fi
+done

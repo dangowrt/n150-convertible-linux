@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Progressive battery-idle sleep ladder for this 8-inch N150 convertible.
+
+WHILE ON BATTERY ONLY (on AC nothing happens; lid is handled by logind):
+  PS_BLANK_SEC    idle -> screen off          (delegated to GNOME idle-delay)
+  PS_SUSPEND_SEC  idle -> begin sleep ladder:
+                    1. s2idle  for PS_S2IDLE_SEC   (light, instant resume)
+                    2. deep S3 for PS_DEEP_SEC     (deeper RAM suspend)
+                    3. hibernate                   (suspend-to-disk, terminal)
+
+The ladder ABORTS at any stage if the user returns (the suspend is woken
+noticeably earlier than its RTC alarm -> treated as user activity) or if AC
+is plugged in between stages. Runs as root because the timed RAM-suspend
+transitions need rtcwake; it reaches the active GNOME session (as that user)
+only to read mutter's idle time and to set the screen-blank delay.
+
+systemd has no native 3-stage suspend, hence this orchestrator. The deeper
+two transitions use rtcwake (arm RTC + suspend, return on wake); the final
+hibernate uses `systemctl hibernate` (HibernateMode=shutdown from sleep.conf).
+"""
+import os, time, glob, pwd, subprocess
+
+def cfg(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+BLANK_SEC   = cfg('PS_BLANK_SEC',   600)   # 10 min -> screen off
+SUSPEND_SEC = cfg('PS_SUSPEND_SEC', 900)   # 15 min -> ladder begins
+S2IDLE_SEC  = cfg('PS_S2IDLE_SEC',  420)   # 15 -> ~22 min in s2idle
+DEEP_SEC    = cfg('PS_DEEP_SEC',    480)   # ~22 -> 30 min in deep S3
+POLL_SEC    = cfg('PS_POLL_SEC',     30)
+DRYRUN      = cfg('PS_DRYRUN',        0)   # 1 = log actions, never really sleep
+CRIT_PCT    = cfg('PS_CRIT_PCT',     10)   # <=this% battery: skip ladder, hibernate now
+VOLT_FLOOR_MV = cfg('PS_VOLT_FLOOR_MV', 0) # >0: emergency hibernate at/below this terminal mV
+VOLT_DEBOUNCE = cfg('PS_VOLT_DEBOUNCE', 2) # consecutive low-voltage samples before firing
+WAKE_MARGIN = 20                           # early-wake slack (seconds)
+LOWV_POLL   = 10                           # tighter poll (s) once voltage is near the floor
+
+def log(msg):
+    print(msg, flush=True)
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+def on_battery():
+    """True iff a Mains supply exists and reports offline (running on battery)."""
+    for typef in glob.glob('/sys/class/power_supply/*/type'):
+        base = os.path.dirname(typef)
+        try:
+            if open(typef).read().strip() == 'Mains':
+                return open(os.path.join(base, 'online')).read().strip() == '0'
+        except OSError:
+            continue
+    return False   # no AC adapter device found -> be safe, treat as AC
+
+def battery_pct():
+    """Capacity % of the main system battery, or None if unreadable.
+    Skips Device-scoped supplies (touchpad/stylus etc.), reads the laptop cell."""
+    for typef in glob.glob('/sys/class/power_supply/*/type'):
+        base = os.path.dirname(typef)
+        try:
+            if open(typef).read().strip() != 'Battery':
+                continue
+            try:
+                if open(os.path.join(base, 'scope')).read().strip() == 'Device':
+                    continue                      # peripheral battery -> not ours
+            except OSError:
+                pass                              # no scope file -> system battery
+            return int(open(os.path.join(base, 'capacity')).read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+def battery_mv():
+    """Terminal voltage of the main system battery in millivolts, or None.
+    Voltage is the only trustworthy 'about to die' signal on this lying gauge."""
+    for typef in glob.glob('/sys/class/power_supply/*/type'):
+        base = os.path.dirname(typef)
+        try:
+            if open(typef).read().strip() != 'Battery':
+                continue
+            try:
+                if open(os.path.join(base, 'scope')).read().strip() == 'Device':
+                    continue
+            except OSError:
+                pass
+            return int(open(os.path.join(base, 'voltage_now')).read().strip()) // 1000
+        except (OSError, ValueError):
+            continue
+    return None
+
+def active_session():
+    """(uid, gid, runtime_dir) of the active graphical session, or None."""
+    r = run(['loginctl', 'list-sessions', '--no-legend'])
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) < 2:
+            continue
+        sid, uid = f[0], f[1]
+        p = run(['loginctl', 'show-session', sid, '-p', 'Active', '-p', 'Type'])
+        props = dict(x.split('=', 1) for x in p.stdout.splitlines() if '=' in x)
+        if props.get('Active') == 'yes' and props.get('Type') in ('wayland', 'x11'):
+            try:
+                pw = pwd.getpwuid(int(uid))
+                return pw.pw_uid, pw.pw_gid, f'/run/user/{uid}'
+            except (KeyError, ValueError):
+                return None
+    return None
+
+def as_user(sess, argv):
+    uid, gid, runtime = sess
+    # HOME is required or dconf/gsettings silently falls back to the in-memory
+    # backend (writes are lost, reads return schema defaults).
+    home = pwd.getpwuid(uid).pw_dir
+    env = ['HOME=' + home,
+           'XDG_RUNTIME_DIR=' + runtime,
+           'DBUS_SESSION_BUS_ADDRESS=unix:path=' + runtime + '/bus']
+    # setpriv drops to the user WITHOUT opening a PAM session (no journal spam).
+    return run(['setpriv', '--reuid', str(uid), '--regid', str(gid),
+                '--init-groups', 'env'] + env + argv)
+
+def idle_seconds(sess):
+    r = as_user(sess, ['gdbus', 'call', '--session',
+                       '--dest', 'org.gnome.Mutter.IdleMonitor',
+                       '--object-path', '/org/gnome/Mutter/IdleMonitor/Core',
+                       '--method', 'org.gnome.Mutter.IdleMonitor.GetIdletime'])
+    try:                                    # output like: (uint64 173,)
+        return int(r.stdout.strip().strip('(),').split()[-1]) / 1000.0
+    except (ValueError, IndexError):
+        return None
+
+def set_idle_delay(sess, secs):
+    as_user(sess, ['gsettings', 'set', 'org.gnome.desktop.session',
+                   'idle-delay', f'uint32 {secs}'])
+
+def is_inhibited(sess, mask):
+    """GNOME SessionManager.IsInhibited(mask): 8=idle, 4=suspend (8|4=12).
+    Catches video players / browsers that hold an idle or suspend inhibitor
+    (incl. the bridged org.freedesktop.ScreenSaver). Fails safe -> True."""
+    r = as_user(sess, ['gdbus', 'call', '--session',
+                       '--dest', 'org.gnome.SessionManager',
+                       '--object-path', '/org/gnome/SessionManager',
+                       '--method', 'org.gnome.SessionManager.IsInhibited',
+                       str(mask)])
+    if 'true' in r.stdout:
+        return True
+    if 'false' in r.stdout:
+        return False
+    return True   # query failed -> don't blank/suspend over a video
+
+def boottime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+def timed_suspend(mode, secs):
+    """Suspend (rtcwake) for `secs`. Return True if woken early (=> abort)."""
+    log(f'ladder: entering {mode} for {secs}s')
+    if DRYRUN:
+        for _ in range(secs):               # let AC-unplug abort even in dryrun
+            time.sleep(1)
+            if not on_battery():
+                return True
+        log(f'[dryrun] {mode} elapsed {secs}s')
+        return False
+    t0 = boottime()
+    run(['rtcwake', '-m', mode, '-s', str(secs)])
+    elapsed = boottime() - t0
+    early = elapsed < secs - WAKE_MARGIN
+    log(f'ladder: {mode} exit after {elapsed:.0f}s (early-wake={early})')
+    return early
+
+def run_ladder(sess):
+    log('ladder: battery idle threshold reached -> starting')
+    run(['loginctl', 'lock-sessions'])
+    for mode, secs in (('freeze', S2IDLE_SEC), ('mem', DEEP_SEC)):
+        if not on_battery():
+            log('ladder: on AC now -> abort'); return
+        pct = battery_pct()
+        if pct is not None and pct <= CRIT_PCT:
+            # Too low to gamble on volatile RAM-suspend -> save the session now.
+            log(f'ladder: battery {pct}% <= {CRIT_PCT}% -> skip remaining rungs, hibernate now')
+            break
+        if timed_suspend(mode, secs):
+            log('ladder: user returned -> abort'); return
+    if not on_battery():
+        log('ladder: on AC now -> abort'); return
+    log('ladder: hibernating (suspend-to-disk)')
+    if DRYRUN:
+        log('[dryrun] would: systemctl hibernate'); return
+    run(['systemctl', 'hibernate'])
+
+def main():
+    log(f'progressive-sleep: blank={BLANK_SEC}s suspend={SUSPEND_SEC}s '
+        f's2idle={S2IDLE_SEC}s deep={DEEP_SEC}s poll={POLL_SEC}s '
+        f'crit={CRIT_PCT}% vfloor={VOLT_FLOOR_MV}mV/{VOLT_DEBOUNCE} dryrun={DRYRUN}')
+    armed = True
+    last_delay = None
+    lowv = 0
+    while True:
+        sess = active_session()
+        bat = on_battery()
+        # EMERGENCY voltage floor: the gauge's % lies (read 20% at a true 0% once,
+        # causing a hard power-off + CMOS wipe). Terminal voltage is the physical
+        # truth. Fires regardless of idle/inhibitor; battery only; debounced.
+        if bat and VOLT_FLOOR_MV > 0:
+            mv = battery_mv()
+            if mv is not None and mv <= VOLT_FLOOR_MV:
+                lowv += 1
+                log(f'voltage {mv}mV <= floor {VOLT_FLOOR_MV}mV ({lowv}/{VOLT_DEBOUNCE})')
+                if lowv >= VOLT_DEBOUNCE:
+                    log('EMERGENCY: voltage floor reached -> hibernating now')
+                    if not DRYRUN:
+                        run(['systemctl', 'hibernate'])
+                    lowv = 0
+                    last_delay = None
+                    time.sleep(POLL_SEC)
+                    continue
+            else:
+                lowv = 0
+        else:
+            lowv = 0
+        inhib_idle  = is_inhibited(sess, 8) if sess else False   # video -> no blank
+        inhib_sleep = is_inhibited(sess, 12) if sess else False  # idle|suspend -> no ladder
+        if sess:
+            # Screen-off only on battery AND only when idle is NOT inhibited
+            # (a playing video holds an inhibitor); AC or inhibited -> never blank.
+            want = BLANK_SEC if (bat and not inhib_idle) else 0
+            if want != last_delay:
+                set_idle_delay(sess, want)
+                last_delay = want
+                why = 'battery' if bat else 'AC'
+                if inhib_idle:
+                    why += ', inhibited'
+                log(f'idle-delay -> {want}s ({why})')
+        if bat and sess and not inhib_sleep:
+            idle = idle_seconds(sess)
+            if idle is None:
+                pass
+            elif idle >= SUSPEND_SEC and armed:
+                armed = False
+                run_ladder(sess)
+                last_delay = None               # re-assert idle-delay next loop
+            elif idle < SUSPEND_SEC:
+                armed = True
+        else:
+            armed = True                         # AC / no session / inhibited -> hold off
+        time.sleep(LOWV_POLL if lowv > 0 else POLL_SEC)
+
+if __name__ == '__main__':
+    main()

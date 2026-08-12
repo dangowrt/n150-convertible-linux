@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Samples BAT0 telemetry to a CSV, for discharge-curve / fuel-gauge calibration
+# analysis. sync after each line so the final samples survive power loss.
+log=/var/log/battery-calibration.csv
+b=/sys/class/power_supply/BAT0
+[ -s "$log" ] || echo "iso_time,uptime_s,capacity_pct,energy_wh,power_w,voltage_v,status,ttoe_min" > "$log"
+while true; do
+  cap=$(cat $b/capacity); en=$(cat $b/energy_now); pw=$(cat $b/power_now)
+  vo=$(cat $b/voltage_now); st=$(cat $b/status)
+  awk -v t="$(date -Iseconds)" -v u="$(cut -d. -f1 /proc/uptime)" \
+      -v cap="$cap" -v en="$en" -v pw="$pw" -v vo="$vo" -v st="$st" \
+      'BEGIN{ ttoe = (pw>0 ? (en/pw)*60 : -1);
+              printf "%s,%s,%s,%.3f,%.2f,%.3f,%s,%.1f\n", t,u,cap,en/1e6,pw/1e6,vo/1e6,st,ttoe }' >> "$log"
+  sync
+  sleep 60
+done

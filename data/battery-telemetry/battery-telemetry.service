@@ -1,0 +1,12 @@
+[Unit]
+Description=Battery telemetry logger (1/min to /var/log/battery-calibration.csv)
+Documentation=file:/usr/local/bin/battery-calib-log
+
+[Service]
+ExecStart=/usr/local/bin/battery-calib-log
+Restart=always
+RestartSec=10
+Nice=19
+
+[Install]
+WantedBy=multi-user.target

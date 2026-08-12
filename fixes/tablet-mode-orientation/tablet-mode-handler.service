@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore display orientation on tablet-to-laptop mode switch
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tablet-mode-handler
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

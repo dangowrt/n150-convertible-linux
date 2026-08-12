@@ -1,0 +1,20 @@
+title: 'KOOSMILE / Kooforway 8" Intel N150 convertible mini laptop — Linux review & fixes'
+tagline: 'Linux review, firmware analysis & working fixes'
+description: >-
+  In-depth Linux review, firmware analysis and working fixes for the 8-inch
+  Intel N150 2-in-1 mini laptop sold as KOOSMILE and KOOFORWAY (family "P8";
+  earlier N100 units sold as Topton, Crelander, Aslay). Covers the broken
+  ACPI/DPTF fan code and its fix, tablet-mode switch, screen rotation of the
+  portrait DSI panel, battery gauge placeholders, thermal throttling, and
+  why an ARM SoC would have served this chassis better.
+url: "https://dangowrt.github.io"
+baseurl: "/n150-convertible-linux"
+theme: jekyll-theme-minimal
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /images/device.jpg

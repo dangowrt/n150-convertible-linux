@@ -1,0 +1,27 @@
+[Unit]
+Description=Progressive battery-idle sleep ladder
+Documentation=file:/usr/local/bin/progressive-sleep
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/progressive-sleep
+Restart=always
+RestartSec=5
+# Production timings (battery idle): blank @10m, s2idle @12m, deep S3 @22m,
+# hibernate @45m  (12 + 10 s2idle + 23 deep = 45).
+# PS_CRIT_PCT: at/below this battery %, skip the RAM rungs and hibernate at once.
+# Kept LOW on purpose: resume-from-hibernate is costly here, so the fast-resume
+# ladder (esp. cheap deep S3) stays available until nearly empty. The image
+# write only costs ~0.1%; 3% is a hedge against the OEM gauge lying near 0.
+# PS_VOLT_FLOOR_MV: emergency hibernate at/below this terminal voltage (mV).
+# The EC's hard-cutoff is INCONSISTENT and load-dependent: died at 9.1V/20% under
+# ~44W load, but at 10.38V/2% under ~5W load. So the floor must sit ABOVE the
+# highest observed cutoff (10.38V) with margin. 10800mV (3.6V/cell) = ~9% & ~12min
+# margin at light load, fires earlier (safely) under heavy load. Tune via drop-in.
+# Override for testing with a drop-in:
+#   systemctl edit progressive-sleep   (set PS_DRYRUN=1 and short PS_*_SEC)
+Environment=PS_BLANK_SEC=600 PS_SUSPEND_SEC=720 PS_S2IDLE_SEC=600 PS_DEEP_SEC=1380 PS_POLL_SEC=30 PS_CRIT_PCT=3 PS_VOLT_FLOOR_MV=10800
+
+[Install]
+WantedBy=multi-user.target
